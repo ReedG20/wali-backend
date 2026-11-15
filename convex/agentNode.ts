@@ -320,14 +320,28 @@ function wearerNote(user: Doc<"users">) {
 }
 
 /** What wali can do, so the gate can tell "wali has an answer for this" from venting. */
+/** `p`, or a rejection after `ms`. The timer is always cleared; `p` itself can't be cancelled. */
+async function withDeadline<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_, no) => {
+        timer = setTimeout(() => no(new Error(message)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    // If the deadline won, `p` is still running: make sure a later rejection isn't unhandled.
+    p.catch(() => {});
+  }
+}
+
 async function abilities(user: Doc<"users">) {
   let apps = "";
   if (composio.composioEnabled()) {
     try {
-      const kits = await Promise.race([
-        composio.connectedToolkits(user.opaqueId),
-        new Promise<never>((_, no) => setTimeout(() => no(new Error("timeout")), 4000)),
-      ]);
+      const kits = await withDeadline(composio.connectedToolkits(user.opaqueId), 4000, "timeout");
       apps = kits.map((k) => k.name).join(", ");
     } catch {
       apps = "";
@@ -419,7 +433,7 @@ async function runProactive(
       name: "wali",
       instructions: PROACTIVE_INSTRUCTIONS,
       model: agentModel(),
-      tools: buildTools(ctx, user, home._id),
+      tools: buildTools(ctx, user, home._id, { background: true }),
     });
     // Targeted recall for this moment (the agent can run more with search_memory).
     let related: memory.Hit[] = [];
@@ -631,10 +645,14 @@ export const executeApproval = internalAction({
           approvalId,
           readOnly: a.risk === "read",
         });
+        // A run that started is not done: the ask is already "running" (set above) and
+        // patchBrowserTask settles it, done or failed, when the browser finishes. So for a run
+        // that started only the result is recorded here: writing a status now could overwrite
+        // one a fast-finishing run has already settled.
         await ctx.runMutation(internal.agentData.setApproval, {
           id: approvalId,
-          status: r.status === "failed" ? "failed" : "done",
           result: r,
+          ...(r.status === "failed" ? { status: "failed" as const, ...(r.error ? { error: r.error } : {}) } : {}),
         });
       }
     } catch (e) {
@@ -649,6 +667,25 @@ export const executeApproval = internalAction({
   },
 });
 
+const minutesSince = (ms: number) => Math.max(1, Math.round((Date.now() - ms) / 60_000));
+
+/**
+ * Stop waiting on a run. The task (and the approval it came from) is marked failed, and the
+ * thread says so: without the message, a run that timed out simply went quiet.
+ */
+async function giveUpOnBrowserTask(ctx: ActionCtx, t: Doc<"browserTasks">, why: string) {
+  await ctx.runMutation(internal.agentData.patchBrowserTask, { id: t._id, status: "failed", error: why.slice(0, 300), liveUrl: null });
+  await ctx.runMutation(internal.messages.post, {
+    threadId: t.threadId,
+    userId: t.userId,
+    kind: "update",
+    text: `The browser task didn't finish: ${why}`,
+  });
+}
+
+/** Polls are 5 s apart at first, so this is about a minute of looking for the live view. */
+const LIVE_VIEW_POLLS = 12;
+
 export const pollBrowserTask = internalAction({
   args: { taskId: v.id("browserTasks") },
   handler: async (ctx, { taskId }) => {
@@ -658,18 +695,15 @@ export const pollBrowserTask = internalAction({
     try {
       const { status } = await browserUse.runStatus(t.runId);
       if (!browserUse.TERMINAL.has(status)) {
-        // The browser comes up a few seconds into the run; pick up its live view once, for the chat panel.
-        const liveUrl = t.liveUrl ? undefined : ((await browserUse.liveViewUrl(t.runId).catch(() => null)) ?? undefined);
+        // The browser comes up a few seconds into the run; pick up its live view once, for the chat
+        // panel. Only during the first minute: a run that never reports one would otherwise cost
+        // an extra request on every poll (up to 150).
+        const liveUrl =
+          t.liveUrl || polls > LIVE_VIEW_POLLS ? undefined : ((await browserUse.liveViewUrl(t.runId).catch(() => null)) ?? undefined);
         await ctx.runMutation(internal.agentData.patchBrowserTask, { id: taskId, polls, liveUrl });
         // ~20 minutes of polling, slowing down over time.
         if (polls < 150) await ctx.scheduler.runAfter(polls < 24 ? 5000 : 15000, internal.agentNode.pollBrowserTask, { taskId });
-        else
-          await ctx.runMutation(internal.agentData.patchBrowserTask, {
-            id: taskId,
-            status: "failed",
-            error: "Timed out waiting",
-            liveUrl: null,
-          });
+        else await giveUpOnBrowserTask(ctx, t, `It was still running after ${minutesSince(t.createdAt)} minutes, so wali stopped waiting.`);
         return;
       }
       const run = await browserUse.getRun(t.runId);
@@ -693,7 +727,7 @@ export const pollBrowserTask = internalAction({
     } catch (e) {
       await ctx.runMutation(internal.agentData.patchBrowserTask, { id: taskId, polls });
       if (polls < 150) await ctx.scheduler.runAfter(15000, internal.agentNode.pollBrowserTask, { taskId });
-      else await ctx.runMutation(internal.agentData.patchBrowserTask, { id: taskId, status: "failed", error: errText(e), liveUrl: null });
+      else await giveUpOnBrowserTask(ctx, t, `wali lost contact with the browser: ${errText(e).slice(0, 200)}`);
     }
   },
 });
@@ -716,10 +750,7 @@ export const connections = action({
       try {
         // Bounded: this pages through the app service with no timeout of its own, and the
         // Connections screen sat on a spinner for as long as it took.
-        connected = await Promise.race([
-          composio.connectedToolkits(user.opaqueId),
-          new Promise<never>((_, no) => setTimeout(() => no(new Error("Your apps took too long to answer.")), 12_000)),
-        ]);
+        connected = await withDeadline(composio.connectedToolkits(user.opaqueId), 12_000, "Your apps took too long to answer.");
       } catch (e) {
         error = errText(e);
       }
