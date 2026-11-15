@@ -26,7 +26,7 @@ function gate() {
       userAsked: {
         type: "boolean",
         instructions:
-          "Did the wearer ask for help, ask to be reminded, say they need to do something, make a promise or commitment, or say they wish they knew or had something (\"I wish I knew...\", \"I keep forgetting...\", \"it'd be nice if...\")?",
+          "Did the wearer ask for help, ask to be reminded, say they need to do something, make a promise or commitment, or say they wish they knew or had something (\"I wish I knew...\", \"I keep forgetting...\", \"it'd be nice if...\")? Judge only what is said in `conversation`; `previousConversation` is background that was already judged. Filler, exclamations and rhetorical remarks with nothing to act on (\"I have no idea.\", \"Oh my God\", \"who knows\") are false.",
       },
       canHelp: {
         type: "boolean",
@@ -44,7 +44,8 @@ function gate() {
       },
       urgency: {
         type: "score",
-        instructions: "If wali were to act on this, how soon would it need to happen to be useful?",
+        instructions:
+          "How soon would wali need to act on something in `conversation` for it to be useful? If there is nothing in it to act on, the answer is that it can wait.",
         criteria: [...URGENCY],
       },
       kind: {

@@ -4,6 +4,7 @@ import { internal } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
 import { risk, triggerKind, grantScope } from "./agentSchema";
 import { postMessage } from "./messages";
+import { overlap, stripDateStamp } from "./lib/text";
 
 /** Internal reads and writes used by the agent actions in agentNode.ts. */
 
@@ -180,10 +181,28 @@ export const finishGate = internalMutation({
   handler: async (ctx, { id, ...patch }) => ctx.db.patch(id, patch),
 });
 
+/** Two notes that share this much of their wording say the same thing. */
+const SAME_NOTE = 0.6;
+
+/**
+ * Returns the note's id and whether it was new. The background agent runs after every
+ * conversation and kept saving the same fact again in slightly different words (the approval plan
+ * showed up three times), so a note that says what a recent one already says isn't stored twice.
+ */
 export const saveNote = internalMutation({
   args: { userId: v.id("users"), text: v.string() },
-  handler: async (ctx, { userId, text }) =>
-    ctx.db.insert("notes", { userId, text: text.slice(0, 2000), createdAt: Date.now() }),
+  handler: async (ctx, { userId, text }) => {
+    const clean = stripDateStamp(text).slice(0, 2000);
+    const recent = await ctx.db
+      .query("notes")
+      .withIndex("by_user", (q) => q.eq("userId", userId))
+      .order("desc")
+      .take(50);
+    const same = recent.find((n) => overlap(n.text, clean) >= SAME_NOTE);
+    if (same) return { id: same._id, saved: false };
+    const id = await ctx.db.insert("notes", { userId, text: clean, createdAt: Date.now() });
+    return { id, saved: true };
+  },
 });
 
 export const scheduleFollowup = internalMutation({
@@ -212,6 +231,21 @@ export const markFollowupFired = internalMutation({
   handler: async (ctx, { id }) => ctx.db.patch(id, { status: "fired" }),
 });
 
+const SAME_ASK_WINDOW_MS = 30 * 60_000;
+/** Reworded summaries of one browser task share at least this much wording; different tasks on the same site don't. */
+const SAME_ASK = 0.3;
+
+type Ask = { channel: "composio" | "browser"; toolSlug?: string; summary: string; args?: unknown };
+
+function sameAsk(a: Ask, b: Ask): boolean {
+  if (a.channel !== b.channel) return false;
+  // An app action is the same ask only if it's the same call with the same arguments.
+  if (a.channel === "composio") return a.toolSlug === b.toolSlug && JSON.stringify(a.args ?? null) === JSON.stringify(b.args ?? null);
+  // A browser task is free text: same site and substantially the same request.
+  const site = (x: Ask) => String((x.args as { site?: string } | undefined)?.site ?? "").toLowerCase().replace(/^www\./, "");
+  return site(a) === site(b) && overlap(a.summary, b.summary) >= SAME_ASK;
+}
+
 export const createApproval = internalMutation({
   args: {
     userId: v.id("users"),
@@ -225,10 +259,23 @@ export const createApproval = internalMutation({
     scope: v.optional(grantScope),
   },
   handler: async (ctx, a) => {
+    // One ask per thing. The agent runs again after every conversation and re-proposed the same
+    // action in new words while the first ask was still waiting: three "Waiting for your OK"
+    // notifications for one Gmail summary in five minutes. If the same thing is already pending,
+    // that ask stands and nothing new is posted.
+    const pending = await ctx.db
+      .query("approvals")
+      .withIndex("by_user_status", (q) => q.eq("userId", a.userId).eq("status", "pending"))
+      .order("desc")
+      .take(20);
+    const now = Date.now();
+    const same = pending.find((p) => now - p.createdAt < SAME_ASK_WINDOW_MS && sameAsk(p, a));
+    if (same) return same._id;
+
     const approvalId = await ctx.db.insert("approvals", {
       ...a,
       status: "pending",
-      createdAt: Date.now(),
+      createdAt: now,
     });
     await postMessage(ctx, {
       threadId: a.threadId,
@@ -294,7 +341,9 @@ export const createBrowserTask = internalMutation({
       userId: a.userId,
       kind: "update",
       // The one-line summary is what the user reads; the full task stays on the browserTasks row.
-      text: a.summary ?? `Working on it in the browser: ${a.task}`,
+      // Never the task itself: it's the brief written for the browser agent ("Log in with the
+      // user's existing session… if login requires MFA, stop"), not something to show a person.
+      text: a.summary?.trim() || "Working on it in the browser.",
       browserTaskId: id,
     }, { push: false });
     return id;

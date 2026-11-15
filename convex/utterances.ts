@@ -2,6 +2,7 @@ import { v } from "convex/values";
 import { internalMutation, query } from "./_generated/server";
 import { speakerStat } from "./schema";
 import { internal } from "./_generated/api";
+import { previewText } from "./lib/text";
 
 export const forRecording = query({
   args: { recordingId: v.id("recordings") },
@@ -47,10 +48,7 @@ export const saveTranscript = internalMutation({
     for (const u of old) await ctx.db.delete(u._id);
     for (const u of utterances) await ctx.db.insert("utterances", { recordingId, ...u });
 
-    const preview = utterances
-      .map((u) => `${u.speakerLabel}: ${u.text}`)
-      .join(" ")
-      .slice(0, 160);
+    const preview = previewText(utterances.map((u) => ({ label: u.speakerLabel, text: u.text })));
     await ctx.db.patch(recordingId, {
       status: utterances.length ? "done" : "empty",
       error: undefined,

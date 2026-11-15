@@ -7,7 +7,7 @@ import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { agentModel, CHAT_REASONING, openRouterKey } from "./agent/models";
 import { MIND_INSTRUCTIONS, PROACTIVE_INSTRUCTIONS } from "./agent/prompts";
-import { buildTools, fmtLines, fmtTime, startBrowserTask } from "./agent/tools";
+import { buildTools, fmtLines, fmtNow, fmtTime, startBrowserTask } from "./agent/tools";
 import { policy, runGate, type Verdict } from "./agent/gate";
 import * as composio from "./agent/composio";
 import * as browserUse from "./agent/browserUse";
@@ -66,7 +66,9 @@ async function contextBlock(ctx: ActionCtx, user: Doc<"users">, opts: { transcri
     limit: 120,
   });
   const parts = [
-    `Now: ${fmtTime(Date.now(), tz)} (${tz ?? "America/Chicago"}). User: ${user.name ?? "unknown name"}.`,
+    // The full date and zone, stated as the one clock to trust: with only "Sun 2:50 AM" the model
+    // took the date and hour from elsewhere (a browser report in another zone) and was an hour off.
+    `Now: ${fmtNow(Date.now(), tz)} (${tz ?? "America/Chicago"}). This is the user's local time and the only clock to trust; times inside tool results, web pages and browser reports may be in another time zone. User: ${user.name ?? "unknown name"}.`,
     `Permission setting: ${PERMISSION_PROMPT[user.permissions ?? DEFAULT_PERMISSION_MODE]}`,
     pack.pendingApprovals.length
       ? `Waiting for the user's OK:\n${pack.pendingApprovals.map((a) => `- ${a.summary}`).join("\n")}`
@@ -394,7 +396,7 @@ async function runProactive(
     try {
       gate = await runGate({
         trigger: trigger.kind,
-        localTime: fmtTime(Date.now(), user.timezone),
+        localTime: fmtNow(Date.now(), user.timezone),
         wearer: wearerNote(user),
         walisAbilities: await abilities(user),
         conversation: situation.current.slice(-8000),
@@ -712,7 +714,12 @@ export const connections = action({
     let error: string | null = null;
     if (status.composio) {
       try {
-        connected = await composio.connectedToolkits(user.opaqueId);
+        // Bounded: this pages through the app service with no timeout of its own, and the
+        // Connections screen sat on a spinner for as long as it took.
+        connected = await Promise.race([
+          composio.connectedToolkits(user.opaqueId),
+          new Promise<never>((_, no) => setTimeout(() => no(new Error("Your apps took too long to answer.")), 12_000)),
+        ]);
       } catch (e) {
         error = errText(e);
       }

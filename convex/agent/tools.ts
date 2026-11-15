@@ -7,6 +7,7 @@ import { internal } from "../_generated/api";
 import * as composio from "./composio";
 import * as browserUse from "./browserUse";
 import * as memory from "./memory";
+import { stripDateStamp } from "../lib/text";
 import { classifyBrowser, DEFAULT_PERMISSION_MODE, grantFor, isGranted, needsApproval } from "../lib/permissions";
 
 type Line = { at: number; speaker: string; text: string };
@@ -17,6 +18,24 @@ export function fmtTime(ms: number, tz?: string) {
     weekday: "short",
     hour: "numeric",
     minute: "2-digit",
+  });
+}
+
+/**
+ * The agent's clock: full date, time and zone ("Sunday, November 15, 2026 at 2:50 AM CST").
+ * fmtTime alone ("Sun 2:50 AM") has no date and no zone, so the model filled the gaps from
+ * whatever else it saw (a browser page in another time zone) and told the user it was 3:50.
+ */
+export function fmtNow(ms: number, tz?: string) {
+  return new Date(ms).toLocaleString("en-US", {
+    timeZone: tz || "America/Chicago",
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
   });
 }
 
@@ -43,6 +62,8 @@ export async function startBrowserTask(
   opts: { summary?: string; approvalId?: Id<"approvals">; readOnly?: boolean } = {},
 ) {
   if (opts.readOnly) task += READ_ONLY_RULE;
+  // The cloud browser has its own clock and time zone; sites like Gmail show times in it.
+  task += `\n\nThe user's local time is ${fmtNow(Date.now(), user.timezone)} (${user.timezone ?? "America/Chicago"}). Report every time and date in that time zone, and say so if a page shows a different one.`;
   const taskId = await ctx.runMutation(internal.agentData.createBrowserTask, {
     userId: user._id,
     threadId,
@@ -99,7 +120,8 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
       try {
         const hits = await memory.search(user, query, { limit: 8 });
         return hits.length
-          ? { memories: hits.map((h) => `${h.date ? `[${h.date.slice(0, 10)}] ` : ""}${h.text}`) }
+          ? // The date is its own field, not a "[2026-11-15]" prefix: the model copied that prefix into notes.
+            { memories: hits.map((h) => ({ text: stripDateStamp(h.text), ...(h.date ? { date: h.date.slice(0, 10) } : {}) })) }
           : { memories: [], note: "Nothing relevant in long-term memory. Try search_transcripts for exact words." };
       } catch (e) {
         return { error: String(e instanceof Error ? e.message : e).slice(0, 300) };
@@ -131,13 +153,15 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
 
   const save_note = createTool({
     id: "save_note",
-    description: "Save a short note to the user's memory (a fact, a promise they made, something to revisit).",
+    description:
+      "Save a short note to the user's memory (a fact, a promise they made, something to revisit). One self-contained sentence in the third person, using names (\"Reed plans to ask Ife about the demo on Monday\"), never \"I\" or \"they\" without saying who. No dates in brackets. Don't save something already listed under \"Notes you saved\". A note only stores a fact: it never reminds anyone or wakes you later; use schedule_followup for that.",
     inputSchema: z.object({ text: z.string().min(2).max(2000) }),
     execute: async ({ text }) => {
-      const id = await ctx.runMutation(internal.agentData.saveNote, { userId: user._id, text });
+      const note = await ctx.runMutation(internal.agentData.saveNote, { userId: user._id, text });
+      if (!note.saved) return { saved: false, note: "You already saved this. Nothing new was stored." };
       if (memory.memoryEnabled()) {
         try {
-          await memory.addNote(user, { id, text, at: Date.now() });
+          await memory.addNote(user, { id: note.id, text: stripDateStamp(text), at: Date.now() });
         } catch {
           // The note is still in Convex; a later backfill can resend it.
         }
@@ -149,7 +173,7 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
   const schedule_followup = createTool({
     id: "schedule_followup",
     description:
-      "Wake yourself up later to check in about something (e.g. after a meeting). The note is what you'll want to remember then.",
+      "Wake yourself up later to check in about something (e.g. after a meeting). The note is what you'll want to remember then. This is the only way to come back to something later: if you tell the user you'll ask, remind or check in later, call this in the same turn.",
     inputSchema: z.object({
       minutesFromNow: z.number().min(1).max(60 * 24 * 7),
       note: z.string().min(2).max(500),
