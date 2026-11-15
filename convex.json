@@ -1,0 +1,11 @@
+{
+  "node": {
+    "externalPackages": [
+      "@mastra/core",
+      "@openrouter/ai-sdk-provider",
+      "ai",
+      "@composio/core",
+      "supermemory"
+    ]
+  }
+}
