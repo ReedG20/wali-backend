@@ -4,7 +4,8 @@ import { internal } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
 import { risk, triggerKind, grantScope } from "./agentSchema";
 import { postMessage } from "./messages";
-import { overlap, stripDateStamp } from "./lib/text";
+import { siteKey } from "./lib/permissions";
+import { sameWording, stripDateStamp } from "./lib/text";
 
 /** Internal reads and writes used by the agent actions in agentNode.ts. */
 
@@ -181,25 +182,25 @@ export const finishGate = internalMutation({
   handler: async (ctx, { id, ...patch }) => ctx.db.patch(id, patch),
 });
 
-/** Two notes that share this much of their wording say the same thing. */
-const SAME_NOTE = 0.6;
-
 /**
- * Returns the note's id and whether it was new. The background agent runs after every
- * conversation and kept saving the same fact again in slightly different words (the approval plan
- * showed up three times), so a note that says what a recent one already says isn't stored twice.
+ * Returns the note's id and whether it was new; when it wasn't, `existing` is the note that
+ * already says it, so the model can be told exactly that.
+ *
+ * The background agent runs after every conversation and kept saving the same fact again. Only a
+ * note that repeats a recent one word for word (filler, plurals and punctuation aside) is
+ * skipped: anything else might be a correction, and a correction must always be kept.
  */
 export const saveNote = internalMutation({
   args: { userId: v.id("users"), text: v.string() },
-  handler: async (ctx, { userId, text }) => {
+  handler: async (ctx, { userId, text }): Promise<{ id: Id<"notes">; saved: boolean; existing?: string }> => {
     const clean = stripDateStamp(text).slice(0, 2000);
     const recent = await ctx.db
       .query("notes")
       .withIndex("by_user", (q) => q.eq("userId", userId))
       .order("desc")
       .take(50);
-    const same = recent.find((n) => overlap(n.text, clean) >= SAME_NOTE);
-    if (same) return { id: same._id, saved: false };
+    const same = recent.find((n) => sameWording(n.text, clean));
+    if (same) return { id: same._id, saved: false, existing: same.text };
     const id = await ctx.db.insert("notes", { userId, text: clean, createdAt: Date.now() });
     return { id, saved: true };
   },
@@ -231,21 +232,54 @@ export const markFollowupFired = internalMutation({
   handler: async (ctx, { id }) => ctx.db.patch(id, { status: "fired" }),
 });
 
+/** An ask repeated within this long of one still pending is the same ask. */
 const SAME_ASK_WINDOW_MS = 30 * 60_000;
-/** Reworded summaries of one browser task share at least this much wording; different tasks on the same site don't. */
-const SAME_ASK = 0.3;
+/** How long one pending ask keeps the background agent from asking about the same site or action again. */
+const HOLD_BACKGROUND_MS = 24 * 60 * 60_000;
 
 type Ask = { channel: "composio" | "browser"; toolSlug?: string; summary: string; args?: unknown };
 
+/** The site an ask is about: its hostname, or whatever the model wrote ("Gmail") when that isn't one. */
+function askSite(x: Ask): string | null {
+  const raw = (x.args as { site?: string } | undefined)?.site;
+  return siteKey(raw) ?? (String(raw ?? "").trim().toLowerCase() || null);
+}
+
+/** The same request, asked again. Strict on purpose: a second, different task must still be asked. */
 function sameAsk(a: Ask, b: Ask): boolean {
   if (a.channel !== b.channel) return false;
   // An app action is the same ask only if it's the same call with the same arguments.
   if (a.channel === "composio") return a.toolSlug === b.toolSlug && JSON.stringify(a.args ?? null) === JSON.stringify(b.args ?? null);
-  // A browser task is free text: same site and substantially the same request.
-  const site = (x: Ask) => String((x.args as { site?: string } | undefined)?.site ?? "").toLowerCase().replace(/^www\./, "");
-  return site(a) === site(b) && overlap(a.summary, b.summary) >= SAME_ASK;
+  // A browser task is free text: same site and the same sentence ("what's due today" and
+  // "what's due tomorrow" are two asks).
+  const site = askSite(a);
+  return !!site && site === askSite(b) && sameWording(a.summary, b.summary);
 }
 
+/** For the background agent: is something already waiting for the same site or the same app action? */
+function sameTarget(a: Ask, b: Ask): boolean {
+  if (a.channel !== b.channel) return false;
+  if (a.channel === "composio") return !!a.toolSlug && a.toolSlug === b.toolSlug;
+  const site = askSite(a);
+  return !!site && site === askSite(b);
+}
+
+/**
+ * Posts an ask in the thread, unless it is already there. Returns `existing` (with that ask's
+ * summary) when nothing new was posted, so the caller can tell the model the truth.
+ *
+ * One ask per thing, per thread. The background agent runs again after every conversation and
+ * re-proposed the same action in new words while the first ask was still waiting: three
+ * "Waiting for your OK" notifications for one Gmail summary in five minutes.
+ * - Any caller: an ask that repeats one still pending in this thread isn't posted again.
+ * - `background`: the proactive agent holds back while this thread has an ask from the last day
+ *   still pending for the same site or the same app action. Nobody is waiting on its answer, and
+ *   a second notification about the same place is the thing to avoid. A chat reply never does
+ *   this: two different requests the user made must both be asked. An ask nobody answered stops
+ *   holding it back after a day, so one ignored ask can't silence that site for good.
+ * Other threads are never considered: an ask shown in the home thread must not hide the same ask
+ * in the chat where the user is.
+ */
 export const createApproval = internalMutation({
   args: {
     userId: v.id("users"),
@@ -257,20 +291,20 @@ export const createApproval = internalMutation({
     args: v.any(),
     risk: v.optional(risk),
     scope: v.optional(grantScope),
+    background: v.optional(v.boolean()),
   },
-  handler: async (ctx, a) => {
-    // One ask per thing. The agent runs again after every conversation and re-proposed the same
-    // action in new words while the first ask was still waiting: three "Waiting for your OK"
-    // notifications for one Gmail summary in five minutes. If the same thing is already pending,
-    // that ask stands and nothing new is posted.
+  handler: async (ctx, { background, ...a }): Promise<{ id: Id<"approvals">; existing: boolean; summary: string }> => {
     const pending = await ctx.db
       .query("approvals")
       .withIndex("by_user_status", (q) => q.eq("userId", a.userId).eq("status", "pending"))
       .order("desc")
-      .take(20);
+      .take(40);
     const now = Date.now();
-    const same = pending.find((p) => now - p.createdAt < SAME_ASK_WINDOW_MS && sameAsk(p, a));
-    if (same) return same._id;
+    const here = pending.filter((p) => p.threadId === a.threadId);
+    const same =
+      here.find((p) => now - p.createdAt < SAME_ASK_WINDOW_MS && sameAsk(p, a)) ??
+      (background ? here.find((p) => now - p.createdAt < HOLD_BACKGROUND_MS && sameTarget(p, a)) : undefined);
+    if (same) return { id: same._id, existing: true, summary: same.summary };
 
     const approvalId = await ctx.db.insert("approvals", {
       ...a,
@@ -284,7 +318,7 @@ export const createApproval = internalMutation({
       text: a.summary,
       approvalId,
     });
-    return approvalId;
+    return { id: approvalId, existing: false, summary: a.summary };
   },
 });
 
@@ -296,7 +330,8 @@ export const getApproval = internalQuery({
 export const setApproval = internalMutation({
   args: {
     id: v.id("approvals"),
-    status: v.union(v.literal("running"), v.literal("done"), v.literal("failed")),
+    /** Omit to record a result without touching the status. */
+    status: v.optional(v.union(v.literal("running"), v.literal("done"), v.literal("failed"))),
     result: v.optional(v.any()),
     error: v.optional(v.string()),
   },
@@ -320,6 +355,7 @@ export const createBrowserTask = internalMutation({
   handler: async (ctx, { approvalId, ...a }) => {
     const id = await ctx.db.insert("browserTasks", {
       ...a,
+      ...(approvalId ? { approvalId } : {}),
       status: "starting",
       polls: 0,
       createdAt: Date.now(),
@@ -375,8 +411,22 @@ export const patchBrowserTask = internalMutation({
     /** null clears it (the run is over, so the live view is gone). */
     liveUrl: v.optional(v.union(v.string(), v.null())),
   },
-  handler: async (ctx, { id, liveUrl, ...patch }) =>
-    ctx.db.patch(id, liveUrl === undefined ? patch : { ...patch, liveUrl: liveUrl ?? undefined }),
+  handler: async (ctx, { id, liveUrl, ...patch }) => {
+    await ctx.db.patch(id, liveUrl === undefined ? patch : { ...patch, liveUrl: liveUrl ?? undefined });
+    // An approved run's ask follows the run: it stays "running" until the browser is finished,
+    // then becomes done or failed. Marking it done when the run merely started showed "Done" for
+    // the whole run, and still "Done" if the run then failed.
+    const over = patch.status === "completed" || patch.status === "failed" || patch.status === "cancelled";
+    if (!over) return;
+    const task = await ctx.db.get(id);
+    if (!task?.approvalId) return;
+    const approval = await ctx.db.get(task.approvalId);
+    if (!approval || approval.status === "declined") return;
+    await ctx.db.patch(task.approvalId, {
+      status: patch.status === "completed" ? "done" : "failed",
+      ...(patch.status === "completed" ? {} : { error: (task.error ?? (patch.status === "cancelled" ? "Cancelled" : "The browser task didn't finish")).slice(0, 300) }),
+    });
+  },
 });
 
 export const userByClerkId = internalQuery({

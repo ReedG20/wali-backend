@@ -78,3 +78,10 @@ test("always allow", () => {
   assert.equal(needsApproval("ask", "read", false), true);
   assert.equal(needsApproval("ask", "high", true), true, "a grant never covers high");
 });
+
+test("app grant labels use the app's real name", async () => {
+  const { actionLabel } = await import("../convex/lib/permissions.ts");
+  assert.equal(actionLabel("GOOGLECALENDAR_EVENTS_LIST"), "Google Calendar: events list");
+  assert.equal(actionLabel("GMAIL_FETCH_EMAILS"), "Gmail: fetch emails");
+  assert.equal(actionLabel("ZOHO_GET_RECORDS"), "Zoho: get records");
+});

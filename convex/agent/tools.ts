@@ -8,7 +8,7 @@ import * as composio from "./composio";
 import * as browserUse from "./browserUse";
 import * as memory from "./memory";
 import { stripDateStamp } from "../lib/text";
-import { classifyBrowser, DEFAULT_PERMISSION_MODE, grantFor, isGranted, needsApproval } from "../lib/permissions";
+import { classifyBrowser, DEFAULT_PERMISSION_MODE, grantFor, isGranted, needsApproval, siteKey } from "../lib/permissions";
 
 type Line = { at: number; speaker: string; text: string };
 
@@ -59,9 +59,15 @@ export async function startBrowserTask(
   user: Doc<"users">,
   threadId: Id<"threads">,
   task: string,
-  opts: { summary?: string; approvalId?: Id<"approvals">; readOnly?: boolean } = {},
+  opts: { summary?: string; approvalId?: Id<"approvals">; readOnly?: boolean; onlySite?: string | null } = {},
 ) {
   if (opts.readOnly) task += READ_ONLY_RULE;
+  // Set when an "Always allow" for one site is the reason this runs without asking: the grant
+  // covers that site, so the browser agent is told to stay on it. This is an instruction only;
+  // nothing technical stops it going elsewhere (a Browser Use network policy could).
+  const site = siteKey(opts.onlySite);
+  if (site)
+    task += `\n\nWork on ${site} and the pages it sends you to for signing in. Do not go to other sites for this task; if it can't be done without one, stop and say which site and why.`;
   // The cloud browser has its own clock and time zone; sites like Gmail show times in it.
   task += `\n\nThe user's local time is ${fmtNow(Date.now(), user.timezone)} (${user.timezone ?? "America/Chicago"}). Report every time and date in that time zone, and say so if a page shows a different one.`;
   const taskId = await ctx.runMutation(internal.agentData.createBrowserTask, {
@@ -103,7 +109,22 @@ const ASK_FIRST =
   "true only if the user asked to be asked before this runs (\"ask me first\", \"check with me\"). It makes this wait for their OK whatever their permission setting. Leave false otherwise.";
 
 /** All of wali's tools, bound to one user and the thread where approvals and updates appear. */
-export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"threads">) {
+/**
+ * What the model is told when the ask it wanted to make is already in the thread. In a chat the
+ * user is waiting for an answer and nothing new appears on screen, so it says one line pointing
+ * at the request that's already there; in the background it stays quiet.
+ */
+const alreadyAsked = (summary: string, background: boolean) =>
+  `Nothing new was posted: this thread already has a request waiting for the user's OK ("${summary.slice(0, 160)}"). Don't ask again and don't say anything is done. ` +
+  (background
+    ? "Say nothing about it. If what you wanted is a different task, leave it until they have answered that one."
+    : "Tell the user in one short line that this is already waiting for their OK earlier in the thread; don't repeat its details. If what they want now is a different task, say it has to wait until they answer that one.");
+
+/**
+ * `background`: this run was not started by a message from the user (the proactive agent). Its
+ * asks hold back when the thread already has one waiting for the same site or app action.
+ */
+export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"threads">, opts: { background?: boolean } = {}) {
   const tz = user.timezone;
   const mode = user.permissions ?? DEFAULT_PERMISSION_MODE;
 
@@ -158,7 +179,7 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
     inputSchema: z.object({ text: z.string().min(2).max(2000) }),
     execute: async ({ text }) => {
       const note = await ctx.runMutation(internal.agentData.saveNote, { userId: user._id, text });
-      if (!note.saved) return { saved: false, note: "You already saved this. Nothing new was stored." };
+      if (!note.saved) return { saved: false, note: `Nothing new was stored: a recent note already says exactly this ("${(note.existing ?? "").slice(0, 200)}").` };
       if (memory.memoryEnabled()) {
         try {
           await memory.addNote(user, { id: note.id, text: stripDateStamp(text), at: Date.now() });
@@ -227,7 +248,7 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
         const r = await composio.risk(toolSlug, args);
         const scope = grantFor("composio", r, { toolSlug });
         if (askFirst || needsApproval(mode, r, isGranted(user.alwaysAllow, scope))) {
-          await ctx.runMutation(internal.agentData.createApproval, {
+          const ask = await ctx.runMutation(internal.agentData.createApproval, {
             userId: user._id,
             threadId,
             channel: "composio",
@@ -237,7 +258,11 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
             args,
             risk: r,
             ...(scope ? { scope } : {}),
+            ...(opts.background ? { background: true } : {}),
           });
+          // Same status the clients already know (something is waiting for the user's OK); the
+          // note is what tells the model that nothing new was posted.
+          if (ask.existing) return { status: "awaiting_approval", note: alreadyAsked(ask.summary, !!opts.background) };
           return {
             status: "awaiting_approval",
             note:
@@ -297,8 +322,11 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
       execute: async ({ task, site, readOnly, summary, askFirst }) => {
         const r = classifyBrowser(readOnly);
         const scope = grantFor("browser", r, { site });
-        if (askFirst || needsApproval(mode, r, isGranted(user.alwaysAllow, scope))) {
-          await ctx.runMutation(internal.agentData.createApproval, {
+        const granted = isGranted(user.alwaysAllow, scope);
+        // Would have asked, but the user chose "Always allow" for this site.
+        const viaGrant = granted && needsApproval(mode, r, false);
+        if (askFirst || needsApproval(mode, r, granted)) {
+          const ask = await ctx.runMutation(internal.agentData.createApproval, {
             userId: user._id,
             threadId,
             channel: "browser",
@@ -307,11 +335,15 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
             args: { task, site },
             risk: r,
             ...(scope ? { scope } : {}),
+            ...(opts.background ? { background: true } : {}),
           });
+          // Same status the clients already know (something is waiting for the user's OK); the
+          // note is what tells the model that nothing new was posted.
+          if (ask.existing) return { status: "awaiting_approval", note: alreadyAsked(ask.summary, !!opts.background) };
           return { status: "awaiting_approval", note: `${ASKED} Do not say it's done.` };
         }
         return {
-          ...(await startBrowserTask(ctx, user, threadId, task, { summary, readOnly })),
+          ...(await startBrowserTask(ctx, user, threadId, task, { summary, readOnly, onlySite: viaGrant ? site : null })),
           note: "The user sees it running in the thread, and the result is posted there when it finishes. Don't repeat the task back to them.",
         };
       },

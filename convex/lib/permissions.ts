@@ -145,6 +145,32 @@ export function siteKey(site: string | undefined | null): string | null {
   return /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(host) ? host : null;
 }
 
+/** Display names for toolkit slugs, so a grant reads "Google Calendar: list events", not "Googlecalendar: …". */
+const APP_NAMES: Record<string, string> = {
+  gmail: "Gmail",
+  googlecalendar: "Google Calendar",
+  googledrive: "Google Drive",
+  googledocs: "Google Docs",
+  googlesheets: "Google Sheets",
+  googletasks: "Google Tasks",
+  slack: "Slack",
+  notion: "Notion",
+  todoist: "Todoist",
+  github: "GitHub",
+  linear: "Linear",
+  hubspot: "HubSpot",
+  airtable: "Airtable",
+  outlook: "Outlook",
+  onedrive: "OneDrive",
+};
+
+/** "GOOGLECALENDAR_EVENTS_LIST" -> "Google Calendar: events list". */
+export function actionLabel(toolSlug: string): string {
+  const [app = "", ...rest] = toolSlug.trim().toLowerCase().split("_");
+  const name = APP_NAMES[app] ?? (app ? app[0]!.toUpperCase() + app.slice(1) : "App");
+  return rest.length ? `${name}: ${rest.join(" ")}` : name;
+}
+
 export function grantFor(
   channel: "browser" | "composio",
   risk: Risk,
@@ -157,8 +183,7 @@ export function grantFor(
   }
   const key = String(target.toolSlug ?? "").trim().toUpperCase();
   if (!key) return null;
-  const [app, ...rest] = key.toLowerCase().split("_");
-  return { kind: "app", key, label: `${app![0]!.toUpperCase()}${app!.slice(1)}: ${rest.join(" ")}` };
+  return { kind: "app", key, label: actionLabel(key) };
 }
 
 export function isGranted(grants: Grant[] | undefined | null, g: Grant | null): boolean {

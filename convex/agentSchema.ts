@@ -207,6 +207,8 @@ export const agentTables = {
     sessionId: v.optional(v.string()),
     /** Live view of the run's browser. Set once it is up, cleared when the run ends. */
     liveUrl: v.optional(v.string()),
+    /** The approval this run came from, if it was asked about first. Its status follows the run. */
+    approvalId: v.optional(v.id("approvals")),
     status: v.union(
       v.literal("starting"),
       v.literal("running"),

@@ -6,25 +6,78 @@ const STOP = new Set([
   "are", "was", "has", "have", "had", "will", "from", "about", "into", "what", "any", "all", "can",
 ]);
 
-/** Lowercased content words, cut to a 5-letter stem so "summary" and "summarize" count as the same word. */
-export function wordSet(text: string): Set<string> {
-  const out = new Set<string>();
-  for (const w of text.toLowerCase().replace(/[^a-z0-9\s']/g, " ").split(/\s+/)) {
-    const word = w.replace(/'s$|'/g, "");
+/** Curly quotes to straight ones, so "can’t" and "can't" are the same word. */
+const straighten = (text: string) => text.replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"');
+
+/**
+ * The content words of a sentence, in order: lowercased, without filler words, singular, and cut
+ * to a 5-letter stem ("summary" / "summarize", "step" / "steps" come out the same).
+ */
+export function contentWords(text: string): string[] {
+  const out: string[] = [];
+  for (const w of straighten(text).toLowerCase().replace(/[^a-z0-9\s']/g, " ").split(/\s+/)) {
+    let word = w.replace(/'s$|'/g, "");
     if (word.length < 3 || STOP.has(word)) continue;
-    out.add(word.slice(0, 5));
+    if (word.length > 3 && word.endsWith("s") && !word.endsWith("ss")) word = word.slice(0, -1);
+    out.push(word.slice(0, 5));
   }
   return out;
 }
 
-/** Share of content words two texts have in common (Jaccard), 0 to 1. */
-export function overlap(a: string, b: string): number {
-  const x = wordSet(a);
-  const y = wordSet(b);
-  if (!x.size || !y.size) return 0;
-  let both = 0;
-  for (const w of x) if (y.has(w)) both++;
-  return both / (x.size + y.size - both);
+const DAY_WORDS = new Set([
+  "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+  "january", "february", "march", "april", "june", "july", "august", "september", "october", "november", "december",
+  "today", "tonight", "tomorrow", "yesterday", "morning", "afternoon", "evening", "night", "noon", "midnight",
+  "weekend", "week", "month", "year", "next", "last",
+]);
+const NEGATION = /^(?:not|never|no|cannot|without|none|neither|nor|nobody|nothing)$|n't$/;
+/** Capitalised words that start sentences without naming anything. */
+const NOT_NAMES = new Set([
+  "the", "they", "them", "their", "he", "she", "his", "her", "we", "it", "this", "that", "these", "those", "a", "an",
+  "my", "our", "your", "i", "plan", "plans", "check", "get", "find", "read", "look", "summarize", "summarise",
+  "ask", "remind", "note", "user", "wali", "when", "if", "after", "before", "on", "in", "at", "for", "to",
+]);
+
+/**
+ * The parts of a sentence that change what it says while its other words stay the same, including
+ * ones too short to count as content words: numbers and times, days and dates, names, and
+ * whether it's negated.
+ */
+export function specifics(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const raw of straighten(text).split(/\s+/)) {
+    const token = raw.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9']+$/g, "");
+    if (!token) continue;
+    const lower = token.toLowerCase();
+    // "today's", "Friday's", "Sam's": the word without its possessive.
+    const bare = lower.replace(/'s$/, "");
+    if (/\d/.test(bare)) out.add(bare);
+    else if (DAY_WORDS.has(bare)) out.add(bare);
+    else if (NEGATION.test(lower)) out.add("(not)");
+    else if (/^[A-Z]/.test(token) && !NOT_NAMES.has(bare)) out.add(bare);
+  }
+  return out;
+}
+
+/**
+ * The same sentence again: the same content words in the same order, and the same specifics.
+ * Only filler words, punctuation, capitals and singular/plural may differ.
+ *
+ * This decides whether a note or an ask is skipped as a repeat, so it is deliberately strict.
+ * Looser matching (shared-word percentages) treated corrections as repeats: "…on Friday" after
+ * "…on Monday", "today's" after "tomorrow's", "Ife owes Reed" after "Reed owes Ife", "the green
+ * design" after "the blue design". Skipping one of those loses a fact; keeping a reworded
+ * duplicate only costs a line.
+ */
+export function sameWording(a: string, b: string): boolean {
+  const x = contentWords(a);
+  const y = contentWords(b);
+  if (!x.length || x.length !== y.length || x.some((w, i) => w !== y[i])) return false;
+  const p = specifics(a);
+  const q = specifics(b);
+  if (p.size !== q.size) return false;
+  for (const v of p) if (!q.has(v)) return false;
+  return true;
 }
 
 /**
