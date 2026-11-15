@@ -34,6 +34,10 @@ export const register = mutation({
       .collect();
     const [keep, ...dupes] = existing;
     for (const d of dupes) await ctx.db.delete(d._id);
+    // Nothing new: don't write. An app build that re-registered in a loop sent this several
+    // times a second; each write also re-ran every query that reads pushTokens.
+    const fresh = keep && Date.now() - keep.updatedAt < 24 * 60 * 60_000;
+    if (fresh && keep.userId === user._id && keep.platform === platform && keep.deviceName === deviceName) return;
     const row = { userId: user._id, token, platform, deviceName, updatedAt: Date.now() };
     if (keep) await ctx.db.patch(keep._id, row);
     else await ctx.db.insert("pushTokens", row);
