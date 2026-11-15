@@ -27,6 +27,7 @@ import type * as lib_auth from "../lib/auth.js";
 import type * as lib_gatePolicy from "../lib/gatePolicy.js";
 import type * as lib_permissions from "../lib/permissions.js";
 import type * as lib_sherpa from "../lib/sherpa.js";
+import type * as lib_text from "../lib/text.js";
 import type * as lib_transcript from "../lib/transcript.js";
 import type * as lib_voice from "../lib/voice.js";
 import type * as messages from "../messages.js";
@@ -67,6 +68,7 @@ declare const fullApi: ApiFromModules<{
   "lib/gatePolicy": typeof lib_gatePolicy;
   "lib/permissions": typeof lib_permissions;
   "lib/sherpa": typeof lib_sherpa;
+  "lib/text": typeof lib_text;
   "lib/transcript": typeof lib_transcript;
   "lib/voice": typeof lib_voice;
   messages: typeof messages;

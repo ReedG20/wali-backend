@@ -7,7 +7,8 @@ import { internal } from "../_generated/api";
 import * as composio from "./composio";
 import * as browserUse from "./browserUse";
 import * as memory from "./memory";
-import { classifyBrowser, DEFAULT_PERMISSION_MODE, needsApproval } from "../lib/permissions";
+import { stripDateStamp } from "../lib/text";
+import { classifyBrowser, DEFAULT_PERMISSION_MODE, grantFor, isGranted, needsApproval, siteKey } from "../lib/permissions";
 
 type Line = { at: number; speaker: string; text: string };
 
@@ -17,6 +18,24 @@ export function fmtTime(ms: number, tz?: string) {
     weekday: "short",
     hour: "numeric",
     minute: "2-digit",
+  });
+}
+
+/**
+ * The agent's clock: full date, time and zone ("Sunday, November 15, 2026 at 2:50 AM CST").
+ * fmtTime alone ("Sun 2:50 AM") has no date and no zone, so the model filled the gaps from
+ * whatever else it saw (a browser page in another time zone) and told the user it was 3:50.
+ */
+export function fmtNow(ms: number, tz?: string) {
+  return new Date(ms).toLocaleString("en-US", {
+    timeZone: tz || "America/Chicago",
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
   });
 }
 
@@ -30,17 +49,33 @@ function clip(value: unknown, max = 8000) {
   return s && s.length > max ? `${s.slice(0, max)}… [truncated]` : s;
 }
 
+/** Appended to a lookup, so "read-only" is something the browser agent is held to, not just a label. */
+const READ_ONLY_RULE =
+  "\n\nThis is a read-only task. Only look things up and report back. Do not submit, send, post, buy, book, delete, save or change anything. If the task can't be done without that, stop and say so.";
+
 /** Start a Browser Use run for the user and poll it in the background. */
 export async function startBrowserTask(
   ctx: ActionCtx,
   user: Doc<"users">,
   threadId: Id<"threads">,
   task: string,
+  opts: { summary?: string; approvalId?: Id<"approvals">; readOnly?: boolean; onlySite?: string | null } = {},
 ) {
+  if (opts.readOnly) task += READ_ONLY_RULE;
+  // Set when an "Always allow" for one site is the reason this runs without asking: the grant
+  // covers that site, so the browser agent is told to stay on it. This is an instruction only;
+  // nothing technical stops it going elsewhere (a Browser Use network policy could).
+  const site = siteKey(opts.onlySite);
+  if (site)
+    task += `\n\nWork on ${site} and the pages it sends you to for signing in. Do not go to other sites for this task; if it can't be done without one, stop and say which site and why.`;
+  // The cloud browser has its own clock and time zone; sites like Gmail show times in it.
+  task += `\n\nThe user's local time is ${fmtNow(Date.now(), user.timezone)} (${user.timezone ?? "America/Chicago"}). Report every time and date in that time zone, and say so if a page shows a different one.`;
   const taskId = await ctx.runMutation(internal.agentData.createBrowserTask, {
     userId: user._id,
     threadId,
     task,
+    summary: opts.summary,
+    approvalId: opts.approvalId,
   });
   try {
     let profileId = user.browserProfileId;
@@ -55,7 +90,8 @@ export async function startBrowserTask(
       sessionId: run.sessionId,
       status: "running",
     });
-    await ctx.scheduler.runAfter(5000, internal.agentNode.pollBrowserTask, { taskId });
+    // First look a little early: that poll is what picks up the live view for the chat panel.
+    await ctx.scheduler.runAfter(3000, internal.agentNode.pollBrowserTask, { taskId });
     return { taskId, status: "running" as const };
   } catch (e) {
     const error = String(e instanceof Error ? e.message : e).slice(0, 300);
@@ -64,8 +100,31 @@ export async function startBrowserTask(
   }
 }
 
+/** What the model is told when an action waits: the thread already shows the ask, so it shouldn't narrate it. */
+const ASKED =
+  "The user already sees this request in the thread, with buttons to allow or deny it. Don't describe it again, don't say it's waiting, and don't tell them to approve it; say nothing more, or one short line only if there is something else they need to know.";
+
+/** Lets the user's own "ask me first" be honoured without mislabelling what the action does. */
+const ASK_FIRST =
+  "true only if the user asked to be asked before this runs (\"ask me first\", \"check with me\"). It makes this wait for their OK whatever their permission setting. Leave false otherwise.";
+
 /** All of wali's tools, bound to one user and the thread where approvals and updates appear. */
-export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"threads">) {
+/**
+ * What the model is told when the ask it wanted to make is already in the thread. In a chat the
+ * user is waiting for an answer and nothing new appears on screen, so it says one line pointing
+ * at the request that's already there; in the background it stays quiet.
+ */
+const alreadyAsked = (summary: string, background: boolean) =>
+  `Nothing new was posted: this thread already has a request waiting for the user's OK ("${summary.slice(0, 160)}"). Don't ask again and don't say anything is done. ` +
+  (background
+    ? "Say nothing about it. If what you wanted is a different task, leave it until they have answered that one."
+    : "Tell the user in one short line that this is already waiting for their OK earlier in the thread; don't repeat its details. If what they want now is a different task, say it has to wait until they answer that one.");
+
+/**
+ * `background`: this run was not started by a message from the user (the proactive agent). Its
+ * asks hold back when the thread already has one waiting for the same site or app action.
+ */
+export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"threads">, opts: { background?: boolean } = {}) {
   const tz = user.timezone;
   const mode = user.permissions ?? DEFAULT_PERMISSION_MODE;
 
@@ -82,7 +141,8 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
       try {
         const hits = await memory.search(user, query, { limit: 8 });
         return hits.length
-          ? { memories: hits.map((h) => `${h.date ? `[${h.date.slice(0, 10)}] ` : ""}${h.text}`) }
+          ? // The date is its own field, not a "[2026-11-15]" prefix: the model copied that prefix into notes.
+            { memories: hits.map((h) => ({ text: stripDateStamp(h.text), ...(h.date ? { date: h.date.slice(0, 10) } : {}) })) }
           : { memories: [], note: "Nothing relevant in long-term memory. Try search_transcripts for exact words." };
       } catch (e) {
         return { error: String(e instanceof Error ? e.message : e).slice(0, 300) };
@@ -114,13 +174,15 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
 
   const save_note = createTool({
     id: "save_note",
-    description: "Save a short note to the user's memory (a fact, a promise they made, something to revisit).",
+    description:
+      "Save a short note to the user's memory (a fact, a promise they made, something to revisit). One self-contained sentence in the third person, using names (\"Reed plans to ask Ife about the demo on Monday\"), never \"I\" or \"they\" without saying who. No dates in brackets. Don't save something already listed under \"Notes you saved\". A note only stores a fact: it never reminds anyone or wakes you later; use schedule_followup for that.",
     inputSchema: z.object({ text: z.string().min(2).max(2000) }),
     execute: async ({ text }) => {
-      const id = await ctx.runMutation(internal.agentData.saveNote, { userId: user._id, text });
+      const note = await ctx.runMutation(internal.agentData.saveNote, { userId: user._id, text });
+      if (!note.saved) return { saved: false, note: `Nothing new was stored: a recent note already says exactly this ("${(note.existing ?? "").slice(0, 200)}").` };
       if (memory.memoryEnabled()) {
         try {
-          await memory.addNote(user, { id, text, at: Date.now() });
+          await memory.addNote(user, { id: note.id, text: stripDateStamp(text), at: Date.now() });
         } catch {
           // The note is still in Convex; a later backfill can resend it.
         }
@@ -132,7 +194,7 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
   const schedule_followup = createTool({
     id: "schedule_followup",
     description:
-      "Wake yourself up later to check in about something (e.g. after a meeting). The note is what you'll want to remember then.",
+      "Wake yourself up later to check in about something (e.g. after a meeting). The note is what you'll want to remember then. This is the only way to come back to something later: if you tell the user you'll ask, remind or check in later, call this in the same turn.",
     inputSchema: z.object({
       minutesFromNow: z.number().min(1).max(60 * 24 * 7),
       note: z.string().min(2).max(500),
@@ -180,11 +242,13 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
         summary: z
           .string()
           .describe("One plain sentence for the user describing exactly what this will do, e.g. 'Email Sam: running 10 min late'"),
+        askFirst: z.boolean().optional().describe(ASK_FIRST),
       }),
-      execute: async ({ toolSlug, arguments: args, summary }) => {
+      execute: async ({ toolSlug, arguments: args, summary, askFirst }) => {
         const r = await composio.risk(toolSlug, args);
-        if (needsApproval(mode, r)) {
-          await ctx.runMutation(internal.agentData.createApproval, {
+        const scope = grantFor("composio", r, { toolSlug });
+        if (askFirst || needsApproval(mode, r, isGranted(user.alwaysAllow, scope))) {
+          const ask = await ctx.runMutation(internal.agentData.createApproval, {
             userId: user._id,
             threadId,
             channel: "composio",
@@ -193,13 +257,18 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
             toolSlug,
             args,
             risk: r,
+            ...(scope ? { scope } : {}),
+            ...(opts.background ? { background: true } : {}),
           });
+          // Same status the clients already know (something is waiting for the user's OK); the
+          // note is what tells the model that nothing new was posted.
+          if (ask.existing) return { status: "awaiting_approval", note: alreadyAsked(ask.summary, !!opts.background) };
           return {
             status: "awaiting_approval",
             note:
               r === "read"
-                ? "The user sees an approval card. Once they approve, the result comes back to you and you can continue."
-                : "The user sees an approval card. Do not say it's done.",
+                ? `${ASKED} Once they allow it, the result comes back to you and you can continue.`
+                : `${ASKED} Do not say it's done.`,
           };
         }
         try {
@@ -236,27 +305,47 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
     tools.browser_task = createTool({
       id: "browser_task",
       description:
-        "Hand a website task to a cloud browser agent (for sites without an API). Runs in the background and reports back in this thread. Set usesAccount when it acts on the user's own accounts. Depending on the user's permission setting it may wait for their OK first.",
+        "Hand a website task to a cloud browser agent (for sites without an API). Runs in the background and reports back in this thread. A task that only looks something up (readOnly) usually runs straight away; one that changes anything waits for the user's OK unless their permission setting says otherwise.",
       inputSchema: z.object({
         task: z.string().describe("Complete, self-contained instructions including the site and what to report back."),
-        usesAccount: z.boolean(),
-        summary: z.string().describe("One sentence for the user describing what the browser will do."),
+        site: z.string().describe("Hostname of the main site it works on, e.g. 'canvas.wisc.edu'."),
+        readOnly: z
+          .boolean()
+          .describe(
+            "What the task does, not whether to ask: true if it just looks things up and reports back, false if it submits, sends, posts, buys, books, deletes, saves or changes anything at all. Never set this false to make it ask; use askFirst for that.",
+          ),
+        askFirst: z.boolean().optional().describe(ASK_FIRST),
+        summary: z
+          .string()
+          .describe("One short plain sentence for the user saying what the browser will do, e.g. 'Check Canvas for what's due today'."),
       }),
-      execute: async ({ task, usesAccount, summary }) => {
-        const r = classifyBrowser(usesAccount);
-        if (needsApproval(mode, r)) {
-          await ctx.runMutation(internal.agentData.createApproval, {
+      execute: async ({ task, site, readOnly, summary, askFirst }) => {
+        const r = classifyBrowser(readOnly);
+        const scope = grantFor("browser", r, { site });
+        const granted = isGranted(user.alwaysAllow, scope);
+        // Would have asked, but the user chose "Always allow" for this site.
+        const viaGrant = granted && needsApproval(mode, r, false);
+        if (askFirst || needsApproval(mode, r, granted)) {
+          const ask = await ctx.runMutation(internal.agentData.createApproval, {
             userId: user._id,
             threadId,
             channel: "browser",
             title: "Browser task",
             summary,
-            args: { task },
+            args: { task, site },
             risk: r,
+            ...(scope ? { scope } : {}),
+            ...(opts.background ? { background: true } : {}),
           });
-          return { status: "awaiting_approval" };
+          // Same status the clients already know (something is waiting for the user's OK); the
+          // note is what tells the model that nothing new was posted.
+          if (ask.existing) return { status: "awaiting_approval", note: alreadyAsked(ask.summary, !!opts.background) };
+          return { status: "awaiting_approval", note: `${ASKED} Do not say it's done.` };
         }
-        return startBrowserTask(ctx, user, threadId, task);
+        return {
+          ...(await startBrowserTask(ctx, user, threadId, task, { summary, readOnly, onlySite: viaGrant ? site : null })),
+          note: "The user sees it running in the thread, and the result is posted there when it finishes. Don't repeat the task back to them.",
+        };
       },
     });
   }

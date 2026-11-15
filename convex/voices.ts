@@ -4,6 +4,7 @@ import type { Doc, Id } from "./_generated/dataModel";
 import { internal } from "./_generated/api";
 import { requireUser, currentUser } from "./lib/auth";
 import { CENTROID_MAX_WEIGHT, guessWearer, meanUnit, updateCentroid, type VoiceStats } from "./lib/voice";
+import { previewText } from "./lib/text";
 
 /**
  * Who said what, across conversations. voiceprint.run (Node) embeds each speaker's clean speech and
@@ -58,10 +59,7 @@ async function relabelRecording(ctx: MutationCtx, recordingId: Id<"recordings">)
     }
   }
   if (changed) {
-    const preview = utterances
-      .map((u) => `${resolved.get(u.speakerRaw)?.label ?? u.speakerLabel}: ${u.text}`)
-      .join(" ")
-      .slice(0, 160);
+    const preview = previewText(utterances.map((u) => ({ label: resolved.get(u.speakerRaw)?.label ?? u.speakerLabel, text: u.text })));
     await ctx.db.patch(recordingId, { preview: preview || undefined });
   }
   return changed;

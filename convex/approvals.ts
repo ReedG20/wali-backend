@@ -25,8 +25,10 @@ export const decide = mutation({
     id: v.id("approvals"),
     decision: v.union(v.literal("approve"), v.literal("decline")),
     editedArgs: v.optional(v.any()),
+    /** With approve: also stop asking for this scope from now on. Ignored if it has none. */
+    always: v.optional(v.boolean()),
   },
-  handler: async (ctx, { id, decision, editedArgs }) => {
+  handler: async (ctx, { id, decision, editedArgs, always }) => {
     const user = await requireUser(ctx);
     const a = await ctx.db.get(id);
     if (!a || a.userId !== user._id) throw new Error("Not found");
@@ -34,6 +36,11 @@ export const decide = mutation({
     if (decision === "decline") {
       await ctx.db.patch(id, { status: "declined", decidedAt: Date.now() });
       return;
+    }
+    if (always && a.scope) {
+      const scope = a.scope;
+      const kept = (user.alwaysAllow ?? []).filter((g) => !(g.kind === scope.kind && g.key === scope.key));
+      await ctx.db.patch(user._id, { alwaysAllow: [...kept, { ...scope, createdAt: Date.now() }] });
     }
     await ctx.db.patch(id, {
       status: "approved",

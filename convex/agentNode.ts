@@ -7,7 +7,7 @@ import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { agentModel, CHAT_REASONING, openRouterKey } from "./agent/models";
 import { MIND_INSTRUCTIONS, PROACTIVE_INSTRUCTIONS } from "./agent/prompts";
-import { buildTools, fmtLines, fmtTime, startBrowserTask } from "./agent/tools";
+import { buildTools, fmtLines, fmtNow, fmtTime, startBrowserTask } from "./agent/tools";
 import { policy, runGate, type Verdict } from "./agent/gate";
 import * as composio from "./agent/composio";
 import * as browserUse from "./agent/browserUse";
@@ -18,7 +18,7 @@ import { DEFAULT_PERMISSION_MODE, type PermissionMode } from "./lib/permissions"
 const PERMISSION_PROMPT: Record<PermissionMode, string> = {
   ask: "Ask every time. Every app action and browser task waits for the user's OK, reads included. Batch what you need into as few asks as you can.",
   balanced:
-    "Ask for what matters. Reads and small private changes run now; anything that reaches other people, spends money, deletes, or uses their accounts in the browser waits for their OK.",
+    "Ask for what matters. Reads and small private changes run now, including a browser task that only looks something up; anything that reaches other people, spends money, deletes, or changes something through the browser waits for their OK.",
   auto: "Don't ask. Your actions run straight away, so be careful and say plainly what you did.",
 };
 
@@ -66,7 +66,9 @@ async function contextBlock(ctx: ActionCtx, user: Doc<"users">, opts: { transcri
     limit: 120,
   });
   const parts = [
-    `Now: ${fmtTime(Date.now(), tz)} (${tz ?? "America/Chicago"}). User: ${user.name ?? "unknown name"}.`,
+    // The full date and zone, stated as the one clock to trust: with only "Sun 2:50 AM" the model
+    // took the date and hour from elsewhere (a browser report in another zone) and was an hour off.
+    `Now: ${fmtNow(Date.now(), tz)} (${tz ?? "America/Chicago"}). This is the user's local time and the only clock to trust; times inside tool results, web pages and browser reports may be in another time zone. User: ${user.name ?? "unknown name"}.`,
     `Permission setting: ${PERMISSION_PROMPT[user.permissions ?? DEFAULT_PERMISSION_MODE]}`,
     pack.pendingApprovals.length
       ? `Waiting for the user's OK:\n${pack.pendingApprovals.map((a) => `- ${a.summary}`).join("\n")}`
@@ -318,14 +320,28 @@ function wearerNote(user: Doc<"users">) {
 }
 
 /** What wali can do, so the gate can tell "wali has an answer for this" from venting. */
+/** `p`, or a rejection after `ms`. The timer is always cleared; `p` itself can't be cancelled. */
+async function withDeadline<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_, no) => {
+        timer = setTimeout(() => no(new Error(message)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    // If the deadline won, `p` is still running: make sure a later rejection isn't unhandled.
+    p.catch(() => {});
+  }
+}
+
 async function abilities(user: Doc<"users">) {
   let apps = "";
   if (composio.composioEnabled()) {
     try {
-      const kits = await Promise.race([
-        composio.connectedToolkits(user.opaqueId),
-        new Promise<never>((_, no) => setTimeout(() => no(new Error("timeout")), 4000)),
-      ]);
+      const kits = await withDeadline(composio.connectedToolkits(user.opaqueId), 4000, "timeout");
       apps = kits.map((k) => k.name).join(", ");
     } catch {
       apps = "";
@@ -394,7 +410,7 @@ async function runProactive(
     try {
       gate = await runGate({
         trigger: trigger.kind,
-        localTime: fmtTime(Date.now(), user.timezone),
+        localTime: fmtNow(Date.now(), user.timezone),
         wearer: wearerNote(user),
         walisAbilities: await abilities(user),
         conversation: situation.current.slice(-8000),
@@ -417,7 +433,7 @@ async function runProactive(
       name: "wali",
       instructions: PROACTIVE_INSTRUCTIONS,
       model: agentModel(),
-      tools: buildTools(ctx, user, home._id),
+      tools: buildTools(ctx, user, home._id, { background: true }),
     });
     // Targeted recall for this moment (the agent can run more with search_memory).
     let related: memory.Hit[] = [];
@@ -615,18 +631,28 @@ export const executeApproval = internalAction({
             return;
           }
         }
-        await ctx.runMutation(internal.messages.post, {
-          threadId: a.threadId,
-          userId: a.userId,
-          kind: "update",
-          text: ok ? `Done: ${a.summary}` : `That didn't go through: ${String(res?.error ?? "unknown error").slice(0, 200)}`,
-        });
+        // Success needs no second message: the request the user approved turns into its own receipt.
+        if (!ok)
+          await ctx.runMutation(internal.messages.post, {
+            threadId: a.threadId,
+            userId: a.userId,
+            kind: "update",
+            text: `That didn't go through: ${String(res?.error ?? "unknown error").slice(0, 200)}`,
+          });
       } else if (a.channel === "browser") {
-        const r = await startBrowserTask(ctx, user, a.threadId, String(a.args?.task ?? a.summary));
+        const r = await startBrowserTask(ctx, user, a.threadId, String(a.args?.task ?? a.summary), {
+          summary: a.summary,
+          approvalId,
+          readOnly: a.risk === "read",
+        });
+        // A run that started is not done: the ask is already "running" (set above) and
+        // patchBrowserTask settles it, done or failed, when the browser finishes. So for a run
+        // that started only the result is recorded here: writing a status now could overwrite
+        // one a fast-finishing run has already settled.
         await ctx.runMutation(internal.agentData.setApproval, {
           id: approvalId,
-          status: r.status === "failed" ? "failed" : "done",
           result: r,
+          ...(r.status === "failed" ? { status: "failed" as const, ...(r.error ? { error: r.error } : {}) } : {}),
         });
       }
     } catch (e) {
@@ -641,6 +667,25 @@ export const executeApproval = internalAction({
   },
 });
 
+const minutesSince = (ms: number) => Math.max(1, Math.round((Date.now() - ms) / 60_000));
+
+/**
+ * Stop waiting on a run. The task (and the approval it came from) is marked failed, and the
+ * thread says so: without the message, a run that timed out simply went quiet.
+ */
+async function giveUpOnBrowserTask(ctx: ActionCtx, t: Doc<"browserTasks">, why: string) {
+  await ctx.runMutation(internal.agentData.patchBrowserTask, { id: t._id, status: "failed", error: why.slice(0, 300), liveUrl: null });
+  await ctx.runMutation(internal.messages.post, {
+    threadId: t.threadId,
+    userId: t.userId,
+    kind: "update",
+    text: `The browser task didn't finish: ${why}`,
+  });
+}
+
+/** Polls are 5 s apart at first, so this is about a minute of looking for the live view. */
+const LIVE_VIEW_POLLS = 12;
+
 export const pollBrowserTask = internalAction({
   args: { taskId: v.id("browserTasks") },
   handler: async (ctx, { taskId }) => {
@@ -650,10 +695,15 @@ export const pollBrowserTask = internalAction({
     try {
       const { status } = await browserUse.runStatus(t.runId);
       if (!browserUse.TERMINAL.has(status)) {
-        await ctx.runMutation(internal.agentData.patchBrowserTask, { id: taskId, polls });
+        // The browser comes up a few seconds into the run; pick up its live view once, for the chat
+        // panel. Only during the first minute: a run that never reports one would otherwise cost
+        // an extra request on every poll (up to 150).
+        const liveUrl =
+          t.liveUrl || polls > LIVE_VIEW_POLLS ? undefined : ((await browserUse.liveViewUrl(t.runId).catch(() => null)) ?? undefined);
+        await ctx.runMutation(internal.agentData.patchBrowserTask, { id: taskId, polls, liveUrl });
         // ~20 minutes of polling, slowing down over time.
         if (polls < 150) await ctx.scheduler.runAfter(polls < 24 ? 5000 : 15000, internal.agentNode.pollBrowserTask, { taskId });
-        else await ctx.runMutation(internal.agentData.patchBrowserTask, { id: taskId, status: "failed", error: "Timed out waiting" });
+        else await giveUpOnBrowserTask(ctx, t, `It was still running after ${minutesSince(t.createdAt)} minutes, so wali stopped waiting.`);
         return;
       }
       const run = await browserUse.getRun(t.runId);
@@ -664,6 +714,7 @@ export const pollBrowserTask = internalAction({
         status: ok ? "completed" : status === "cancelled" ? "cancelled" : "failed",
         result: run.result ?? undefined,
         error: run.error ?? undefined,
+        liveUrl: null,
       });
       await ctx.runMutation(internal.messages.post, {
         threadId: t.threadId,
@@ -676,7 +727,7 @@ export const pollBrowserTask = internalAction({
     } catch (e) {
       await ctx.runMutation(internal.agentData.patchBrowserTask, { id: taskId, polls });
       if (polls < 150) await ctx.scheduler.runAfter(15000, internal.agentNode.pollBrowserTask, { taskId });
-      else await ctx.runMutation(internal.agentData.patchBrowserTask, { id: taskId, status: "failed", error: errText(e) });
+      else await giveUpOnBrowserTask(ctx, t, `wali lost contact with the browser: ${errText(e).slice(0, 200)}`);
     }
   },
 });
@@ -697,7 +748,9 @@ export const connections = action({
     let error: string | null = null;
     if (status.composio) {
       try {
-        connected = await composio.connectedToolkits(user.opaqueId);
+        // Bounded: this pages through the app service with no timeout of its own, and the
+        // Connections screen sat on a spinner for as long as it took.
+        connected = await withDeadline(composio.connectedToolkits(user.opaqueId), 12_000, "Your apps took too long to answer.");
       } catch (e) {
         error = errText(e);
       }
