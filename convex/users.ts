@@ -107,6 +107,17 @@ export const updatePermissions = mutation({
   },
 });
 
+/** Take back an "Always allow": wali asks about it again from now on. */
+export const removeAlwaysAllow = mutation({
+  args: { kind: v.union(v.literal("browser"), v.literal("app")), key: v.string() },
+  handler: async (ctx, { kind, key }) => {
+    const user = await requireUser(ctx);
+    await ctx.db.patch(user._id, {
+      alwaysAllow: (user.alwaysAllow ?? []).filter((g) => !(g.kind === kind && g.key === key)),
+    });
+  },
+});
+
 /** Which of wali's messages also reach the user's phone. */
 export const updateNotify = mutation({
   args: notifyPrefs.fields,

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classifyBrowser, classifyComposio, needsApproval } from "../convex/lib/permissions.ts";
+import { classifyBrowser, classifyComposio, grantFor, isGranted, needsApproval, siteKey } from "../convex/lib/permissions.ts";
 
 // Tags below are copied from Composio's live tools API (2026-11-14).
 const c = (slug: string, tags: string[] | null, args?: Record<string, unknown>) => classifyComposio(slug, { tags, args });
@@ -54,6 +54,27 @@ test("each mode gates the right risks", () => {
 });
 
 test("browser tasks", () => {
-  assert.equal(classifyBrowser(true), "high");
-  assert.equal(classifyBrowser(false), "read");
+  assert.equal(classifyBrowser(true), "read", "a lookup is a read, signed in or not");
+  assert.equal(classifyBrowser(false), "high", "anything that changes something asks");
+});
+
+test("always allow", () => {
+  assert.equal(siteKey("https://www.Canvas.wisc.edu/courses/1?x=1"), "canvas.wisc.edu");
+  assert.equal(siteKey("canvas"), null);
+  assert.equal(siteKey(undefined), null);
+
+  const site = grantFor("browser", "read", { site: "canvas.wisc.edu" });
+  assert.deepEqual(site, { kind: "browser", key: "canvas.wisc.edu", label: "Reading canvas.wisc.edu" });
+  assert.equal(grantFor("browser", "high", { site: "canvas.wisc.edu" }), null, "changes can't be granted");
+  assert.equal(grantFor("composio", "high", { toolSlug: "GMAIL_SEND_EMAIL" }), null);
+  assert.equal(grantFor("composio", "read", { toolSlug: "gmail_fetch_emails" })?.key, "GMAIL_FETCH_EMAILS");
+
+  const grants = [{ kind: "browser" as const, key: "canvas.wisc.edu" }];
+  assert.equal(isGranted(grants, site), true);
+  assert.equal(isGranted(grants, grantFor("browser", "read", { site: "bank.com" })), false);
+  assert.equal(isGranted(undefined, site), false);
+
+  assert.equal(needsApproval("ask", "read", true), false, "a grant lets a read through in ask mode");
+  assert.equal(needsApproval("ask", "read", false), true);
+  assert.equal(needsApproval("ask", "high", true), true, "a grant never covers high");
 });

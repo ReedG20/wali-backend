@@ -7,7 +7,7 @@ import { internal } from "../_generated/api";
 import * as composio from "./composio";
 import * as browserUse from "./browserUse";
 import * as memory from "./memory";
-import { classifyBrowser, DEFAULT_PERMISSION_MODE, needsApproval } from "../lib/permissions";
+import { classifyBrowser, DEFAULT_PERMISSION_MODE, grantFor, isGranted, needsApproval } from "../lib/permissions";
 
 type Line = { at: number; speaker: string; text: string };
 
@@ -30,17 +30,25 @@ function clip(value: unknown, max = 8000) {
   return s && s.length > max ? `${s.slice(0, max)}… [truncated]` : s;
 }
 
+/** Appended to a lookup, so "read-only" is something the browser agent is held to, not just a label. */
+const READ_ONLY_RULE =
+  "\n\nThis is a read-only task. Only look things up and report back. Do not submit, send, post, buy, book, delete, save or change anything. If the task can't be done without that, stop and say so.";
+
 /** Start a Browser Use run for the user and poll it in the background. */
 export async function startBrowserTask(
   ctx: ActionCtx,
   user: Doc<"users">,
   threadId: Id<"threads">,
   task: string,
+  opts: { summary?: string; approvalId?: Id<"approvals">; readOnly?: boolean } = {},
 ) {
+  if (opts.readOnly) task += READ_ONLY_RULE;
   const taskId = await ctx.runMutation(internal.agentData.createBrowserTask, {
     userId: user._id,
     threadId,
     task,
+    summary: opts.summary,
+    approvalId: opts.approvalId,
   });
   try {
     let profileId = user.browserProfileId;
@@ -55,7 +63,8 @@ export async function startBrowserTask(
       sessionId: run.sessionId,
       status: "running",
     });
-    await ctx.scheduler.runAfter(5000, internal.agentNode.pollBrowserTask, { taskId });
+    // First look a little early: that poll is what picks up the live view for the chat panel.
+    await ctx.scheduler.runAfter(3000, internal.agentNode.pollBrowserTask, { taskId });
     return { taskId, status: "running" as const };
   } catch (e) {
     const error = String(e instanceof Error ? e.message : e).slice(0, 300);
@@ -63,6 +72,14 @@ export async function startBrowserTask(
     return { taskId, status: "failed" as const, error };
   }
 }
+
+/** What the model is told when an action waits: the thread already shows the ask, so it shouldn't narrate it. */
+const ASKED =
+  "The user already sees this request in the thread, with buttons to allow or deny it. Don't describe it again, don't say it's waiting, and don't tell them to approve it; say nothing more, or one short line only if there is something else they need to know.";
+
+/** Lets the user's own "ask me first" be honoured without mislabelling what the action does. */
+const ASK_FIRST =
+  "true only if the user asked to be asked before this runs (\"ask me first\", \"check with me\"). It makes this wait for their OK whatever their permission setting. Leave false otherwise.";
 
 /** All of wali's tools, bound to one user and the thread where approvals and updates appear. */
 export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"threads">) {
@@ -180,10 +197,12 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
         summary: z
           .string()
           .describe("One plain sentence for the user describing exactly what this will do, e.g. 'Email Sam: running 10 min late'"),
+        askFirst: z.boolean().optional().describe(ASK_FIRST),
       }),
-      execute: async ({ toolSlug, arguments: args, summary }) => {
+      execute: async ({ toolSlug, arguments: args, summary, askFirst }) => {
         const r = await composio.risk(toolSlug, args);
-        if (needsApproval(mode, r)) {
+        const scope = grantFor("composio", r, { toolSlug });
+        if (askFirst || needsApproval(mode, r, isGranted(user.alwaysAllow, scope))) {
           await ctx.runMutation(internal.agentData.createApproval, {
             userId: user._id,
             threadId,
@@ -193,13 +212,14 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
             toolSlug,
             args,
             risk: r,
+            ...(scope ? { scope } : {}),
           });
           return {
             status: "awaiting_approval",
             note:
               r === "read"
-                ? "The user sees an approval card. Once they approve, the result comes back to you and you can continue."
-                : "The user sees an approval card. Do not say it's done.",
+                ? `${ASKED} Once they allow it, the result comes back to you and you can continue.`
+                : `${ASKED} Do not say it's done.`,
           };
         }
         try {
@@ -236,27 +256,40 @@ export function buildTools(ctx: ActionCtx, user: Doc<"users">, threadId: Id<"thr
     tools.browser_task = createTool({
       id: "browser_task",
       description:
-        "Hand a website task to a cloud browser agent (for sites without an API). Runs in the background and reports back in this thread. Set usesAccount when it acts on the user's own accounts. Depending on the user's permission setting it may wait for their OK first.",
+        "Hand a website task to a cloud browser agent (for sites without an API). Runs in the background and reports back in this thread. A task that only looks something up (readOnly) usually runs straight away; one that changes anything waits for the user's OK unless their permission setting says otherwise.",
       inputSchema: z.object({
         task: z.string().describe("Complete, self-contained instructions including the site and what to report back."),
-        usesAccount: z.boolean(),
-        summary: z.string().describe("One sentence for the user describing what the browser will do."),
+        site: z.string().describe("Hostname of the main site it works on, e.g. 'canvas.wisc.edu'."),
+        readOnly: z
+          .boolean()
+          .describe(
+            "What the task does, not whether to ask: true if it just looks things up and reports back, false if it submits, sends, posts, buys, books, deletes, saves or changes anything at all. Never set this false to make it ask; use askFirst for that.",
+          ),
+        askFirst: z.boolean().optional().describe(ASK_FIRST),
+        summary: z
+          .string()
+          .describe("One short plain sentence for the user saying what the browser will do, e.g. 'Check Canvas for what's due today'."),
       }),
-      execute: async ({ task, usesAccount, summary }) => {
-        const r = classifyBrowser(usesAccount);
-        if (needsApproval(mode, r)) {
+      execute: async ({ task, site, readOnly, summary, askFirst }) => {
+        const r = classifyBrowser(readOnly);
+        const scope = grantFor("browser", r, { site });
+        if (askFirst || needsApproval(mode, r, isGranted(user.alwaysAllow, scope))) {
           await ctx.runMutation(internal.agentData.createApproval, {
             userId: user._id,
             threadId,
             channel: "browser",
             title: "Browser task",
             summary,
-            args: { task },
+            args: { task, site },
             risk: r,
+            ...(scope ? { scope } : {}),
           });
-          return { status: "awaiting_approval" };
+          return { status: "awaiting_approval", note: `${ASKED} Do not say it's done.` };
         }
-        return startBrowserTask(ctx, user, threadId, task);
+        return {
+          ...(await startBrowserTask(ctx, user, threadId, task, { summary, readOnly })),
+          note: "The user sees it running in the thread, and the result is posted there when it finishes. Don't repeat the task back to them.",
+        };
       },
     });
   }

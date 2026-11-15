@@ -18,7 +18,7 @@ import { DEFAULT_PERMISSION_MODE, type PermissionMode } from "./lib/permissions"
 const PERMISSION_PROMPT: Record<PermissionMode, string> = {
   ask: "Ask every time. Every app action and browser task waits for the user's OK, reads included. Batch what you need into as few asks as you can.",
   balanced:
-    "Ask for what matters. Reads and small private changes run now; anything that reaches other people, spends money, deletes, or uses their accounts in the browser waits for their OK.",
+    "Ask for what matters. Reads and small private changes run now, including a browser task that only looks something up; anything that reaches other people, spends money, deletes, or changes something through the browser waits for their OK.",
   auto: "Don't ask. Your actions run straight away, so be careful and say plainly what you did.",
 };
 
@@ -615,14 +615,20 @@ export const executeApproval = internalAction({
             return;
           }
         }
-        await ctx.runMutation(internal.messages.post, {
-          threadId: a.threadId,
-          userId: a.userId,
-          kind: "update",
-          text: ok ? `Done: ${a.summary}` : `That didn't go through: ${String(res?.error ?? "unknown error").slice(0, 200)}`,
-        });
+        // Success needs no second message: the request the user approved turns into its own receipt.
+        if (!ok)
+          await ctx.runMutation(internal.messages.post, {
+            threadId: a.threadId,
+            userId: a.userId,
+            kind: "update",
+            text: `That didn't go through: ${String(res?.error ?? "unknown error").slice(0, 200)}`,
+          });
       } else if (a.channel === "browser") {
-        const r = await startBrowserTask(ctx, user, a.threadId, String(a.args?.task ?? a.summary));
+        const r = await startBrowserTask(ctx, user, a.threadId, String(a.args?.task ?? a.summary), {
+          summary: a.summary,
+          approvalId,
+          readOnly: a.risk === "read",
+        });
         await ctx.runMutation(internal.agentData.setApproval, {
           id: approvalId,
           status: r.status === "failed" ? "failed" : "done",
@@ -650,10 +656,18 @@ export const pollBrowserTask = internalAction({
     try {
       const { status } = await browserUse.runStatus(t.runId);
       if (!browserUse.TERMINAL.has(status)) {
-        await ctx.runMutation(internal.agentData.patchBrowserTask, { id: taskId, polls });
+        // The browser comes up a few seconds into the run; pick up its live view once, for the chat panel.
+        const liveUrl = t.liveUrl ? undefined : ((await browserUse.liveViewUrl(t.runId).catch(() => null)) ?? undefined);
+        await ctx.runMutation(internal.agentData.patchBrowserTask, { id: taskId, polls, liveUrl });
         // ~20 minutes of polling, slowing down over time.
         if (polls < 150) await ctx.scheduler.runAfter(polls < 24 ? 5000 : 15000, internal.agentNode.pollBrowserTask, { taskId });
-        else await ctx.runMutation(internal.agentData.patchBrowserTask, { id: taskId, status: "failed", error: "Timed out waiting" });
+        else
+          await ctx.runMutation(internal.agentData.patchBrowserTask, {
+            id: taskId,
+            status: "failed",
+            error: "Timed out waiting",
+            liveUrl: null,
+          });
         return;
       }
       const run = await browserUse.getRun(t.runId);
@@ -664,6 +678,7 @@ export const pollBrowserTask = internalAction({
         status: ok ? "completed" : status === "cancelled" ? "cancelled" : "failed",
         result: run.result ?? undefined,
         error: run.error ?? undefined,
+        liveUrl: null,
       });
       await ctx.runMutation(internal.messages.post, {
         threadId: t.threadId,
@@ -676,7 +691,7 @@ export const pollBrowserTask = internalAction({
     } catch (e) {
       await ctx.runMutation(internal.agentData.patchBrowserTask, { id: taskId, polls });
       if (polls < 150) await ctx.scheduler.runAfter(15000, internal.agentNode.pollBrowserTask, { taskId });
-      else await ctx.runMutation(internal.agentData.patchBrowserTask, { id: taskId, status: "failed", error: errText(e) });
+      else await ctx.runMutation(internal.agentData.patchBrowserTask, { id: taskId, status: "failed", error: errText(e), liveUrl: null });
     }
   },
 });

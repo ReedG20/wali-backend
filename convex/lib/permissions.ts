@@ -4,8 +4,9 @@
  * - "ask":      every action outside wali (any app action, any browser task) waits for the user's OK,
  *               reads included. wali's own memory (notes, follow-ups, search) never asks.
  * - "balanced": reads and small private changes (a draft, a label, a task for yourself) run on
- *               their own. Anything that reaches other people, spends money, deletes, or acts on
- *               your accounts through the browser waits for the user.
+ *               their own, and so does a browser task that only looks something up. Anything that
+ *               reaches other people, spends money, deletes, or changes something through the
+ *               browser waits for the user.
  * - "auto":     everything runs straight away.
  */
 export type PermissionMode = "ask" | "balanced" | "auto";
@@ -14,7 +15,9 @@ export const DEFAULT_PERMISSION_MODE: PermissionMode = "balanced";
 /** read: changes nothing. low: a private, reversible change. high: reaches people, money, deletes. */
 export type Risk = "read" | "low" | "high";
 
-export function needsApproval(mode: PermissionMode | undefined, risk: Risk): boolean {
+/** `granted`: the user chose "Always allow" for exactly this (see grantFor). It never covers high. */
+export function needsApproval(mode: PermissionMode | undefined, risk: Risk, granted = false): boolean {
+  if (granted && risk !== "high") return false;
   switch (mode ?? DEFAULT_PERMISSION_MODE) {
     case "auto":
       return false;
@@ -117,9 +120,49 @@ export function classifyComposio(
   return "low";
 }
 
-/** Browser tasks: anything signed in as the user is high; public lookups only read. */
-export function classifyBrowser(usesAccount: boolean): Risk {
-  return usesAccount ? "high" : "read";
+/**
+ * Browser tasks: one that only looks something up is a read, signed in or not (the user asked
+ * for it, and nothing changes). Anything that submits, sends, buys, books or edits is high.
+ */
+export function classifyBrowser(readOnly: boolean): Risk {
+  return readOnly ? "read" : "high";
+}
+
+/**
+ * What "Always allow" covers: reading one site in the browser, or one app action by slug.
+ * High-risk actions (sending, paying, deleting...) can't be granted; they ask every time.
+ */
+export type Grant = { kind: "browser" | "app"; key: string };
+
+/** "https://www.Canvas.wisc.edu/courses" -> "canvas.wisc.edu"; null if it isn't a hostname. */
+export function siteKey(site: string | undefined | null): string | null {
+  const host = String(site ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/^[a-z]+:\/\//, "")
+    .replace(/^www\./, "")
+    .split(/[/?#:]/)[0]!;
+  return /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(host) ? host : null;
+}
+
+export function grantFor(
+  channel: "browser" | "composio",
+  risk: Risk,
+  target: { site?: string | null; toolSlug?: string | null },
+): (Grant & { label: string }) | null {
+  if (risk === "high") return null;
+  if (channel === "browser") {
+    const key = siteKey(target.site);
+    return key ? { kind: "browser", key, label: `Reading ${key}` } : null;
+  }
+  const key = String(target.toolSlug ?? "").trim().toUpperCase();
+  if (!key) return null;
+  const [app, ...rest] = key.toLowerCase().split("_");
+  return { kind: "app", key, label: `${app![0]!.toUpperCase()}${app!.slice(1)}: ${rest.join(" ")}` };
+}
+
+export function isGranted(grants: Grant[] | undefined | null, g: Grant | null): boolean {
+  return !!g && !!grants?.some((x) => x.kind === g.kind && x.key === g.key);
 }
 
 /** Copy shared by the web and iOS settings, so both describe the modes the same way. */

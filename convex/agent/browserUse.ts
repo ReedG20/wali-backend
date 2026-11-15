@@ -46,6 +46,20 @@ export async function getRun(runId: string) {
   );
 }
 
+/**
+ * Where to watch a run's browser (hosted on live.browser-use.com), or null until the browser is
+ * up. Whoever holds the URL can drive the browser, so only its owner ever gets it.
+ */
+export async function liveViewUrl(runId: string) {
+  const { events } = await call<{ events: { type: string; data: Record<string, unknown> }[] }>(
+    "GET",
+    `/runs/${runId}/events?limit=200&include_output=false`,
+  );
+  const ready = events.find((e) => e.type === "browser.ready" || e.type === "browser.reattached");
+  const url = ready?.data.live_view_url;
+  return typeof url === "string" && url ? url : null;
+}
+
 /** A live browser on the user's profile, so they can sign in to sites the agent will use. */
 export async function startSignInBrowser(profileId: string) {
   return call<{ id: string; liveUrl: string | null; status: string }>("POST", "/browsers", {

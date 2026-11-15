@@ -2,7 +2,7 @@ import { v } from "convex/values";
 import { internalMutation, internalQuery } from "./_generated/server";
 import { internal } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
-import { risk, triggerKind } from "./agentSchema";
+import { risk, triggerKind, grantScope } from "./agentSchema";
 import { postMessage } from "./messages";
 
 /** Internal reads and writes used by the agent actions in agentNode.ts. */
@@ -222,6 +222,7 @@ export const createApproval = internalMutation({
     toolSlug: v.optional(v.string()),
     args: v.any(),
     risk: v.optional(risk),
+    scope: v.optional(grantScope),
   },
   handler: async (ctx, a) => {
     const approvalId = await ctx.db.insert("approvals", {
@@ -261,19 +262,39 @@ export const setBrowserProfile = internalMutation({
 });
 
 export const createBrowserTask = internalMutation({
-  args: { userId: v.id("users"), threadId: v.id("threads"), task: v.string() },
-  handler: async (ctx, a) => {
+  args: {
+    userId: v.id("users"),
+    threadId: v.id("threads"),
+    task: v.string(),
+    summary: v.optional(v.string()),
+    /** The approval this run came from: its message becomes the task's row instead of a new one. */
+    approvalId: v.optional(v.id("approvals")),
+  },
+  handler: async (ctx, { approvalId, ...a }) => {
     const id = await ctx.db.insert("browserTasks", {
       ...a,
       status: "starting",
       polls: 0,
       createdAt: Date.now(),
     });
+    if (approvalId) {
+      const recent = await ctx.db
+        .query("messages")
+        .withIndex("by_thread", (q) => q.eq("threadId", a.threadId))
+        .order("desc")
+        .take(200);
+      const asked = recent.find((m) => m.approvalId === approvalId);
+      if (asked) {
+        await ctx.db.patch(asked._id, { browserTaskId: id });
+        return id;
+      }
+    }
     await postMessage(ctx, {
       threadId: a.threadId,
       userId: a.userId,
       kind: "update",
-      text: `Working on it in the browser: ${a.task}`,
+      // The one-line summary is what the user reads; the full task stays on the browserTasks row.
+      text: a.summary ?? `Working on it in the browser: ${a.task}`,
       browserTaskId: id,
     }, { push: false });
     return id;
@@ -302,8 +323,11 @@ export const patchBrowserTask = internalMutation({
     result: v.optional(v.string()),
     error: v.optional(v.string()),
     polls: v.optional(v.number()),
+    /** null clears it (the run is over, so the live view is gone). */
+    liveUrl: v.optional(v.union(v.string(), v.null())),
   },
-  handler: async (ctx, { id, ...patch }) => ctx.db.patch(id, patch),
+  handler: async (ctx, { id, liveUrl, ...patch }) =>
+    ctx.db.patch(id, liveUrl === undefined ? patch : { ...patch, liveUrl: liveUrl ?? undefined }),
 });
 
 export const userByClerkId = internalQuery({

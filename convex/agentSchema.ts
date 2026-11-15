@@ -37,6 +37,12 @@ export const messageKind = v.union(
 /** lib/permissions.ts: how much wali may do without asking. */
 export const permissionMode = v.union(v.literal("ask"), v.literal("balanced"), v.literal("auto"));
 export const risk = v.union(v.literal("read"), v.literal("low"), v.literal("high"));
+/** What an "Always allow" covers (lib/permissions.ts grantFor): one site to read, or one app action. */
+export const grantScope = v.object({
+  kind: v.union(v.literal("browser"), v.literal("app")),
+  key: v.string(),
+  label: v.string(),
+});
 
 /** Which messages also go to the user's phone as push notifications. */
 export const notifyPrefs = v.object({
@@ -85,6 +91,17 @@ export const agentTables = {
     ),
     /** Permission mode; unset means "balanced". */
     permissions: v.optional(permissionMode),
+    /** "Always allow" choices made on an approval; these stop asking in any mode. Never high-risk. */
+    alwaysAllow: v.optional(
+      v.array(
+        v.object({
+          kind: v.union(v.literal("browser"), v.literal("app")),
+          key: v.string(),
+          label: v.string(),
+          createdAt: v.number(),
+        }),
+      ),
+    ),
     /** Push notification preferences; unset means all on. */
     notify: v.optional(notifyPrefs),
     createdAt: v.number(),
@@ -147,6 +164,8 @@ export const agentTables = {
     args: v.any(),
     /** Why it asked. A read hands its result back to wali so it can finish the answer. */
     risk: v.optional(risk),
+    /** Set when this can be allowed for good; absent for high-risk actions. */
+    scope: v.optional(grantScope),
     status: approvalStatus,
     result: v.optional(v.any()),
     error: v.optional(v.string()),
@@ -182,8 +201,12 @@ export const agentTables = {
     userId: v.id("users"),
     threadId: v.id("threads"),
     task: v.string(),
+    /** One plain sentence for the user; the full task is what the browser agent was told. */
+    summary: v.optional(v.string()),
     runId: v.optional(v.string()),
     sessionId: v.optional(v.string()),
+    /** Live view of the run's browser. Set once it is up, cleared when the run ends. */
+    liveUrl: v.optional(v.string()),
     status: v.union(
       v.literal("starting"),
       v.literal("running"),
